@@ -1,0 +1,202 @@
+{
+  "eval_set_name": "carbon_coach_golden_eval",
+  "description": "ADK golden evaluation cases for Carbon Coach conversational agent",
+  "eval_cases": [
+    {
+      "id": "case_1_bus_and_ac_input",
+      "description": "User mentions multi-activity travel by bus and AC usage",
+      "conversation": [
+        {
+          "role": "user",
+          "content": "I travelled 12 km by bus today and used the AC for 4 hours."
+        }
+      ],
+      "expected_tool_calls": [
+        {
+          "tool_name": "calculate_travel_emissions",
+          "parameters": {
+            "mode": "bus",
+            "km": 12.0
+          },
+          "expected_output_subset": {
+            "status": "success",
+            "kg_co2e": 1.068
+          }
+        },
+        {
+          "tool_name": "calculate_appliance_emissions",
+          "parameters": {
+            "appliance": "ac",
+            "hours": 4.0
+          },
+          "expected_output_subset": {
+            "status": "success",
+            "kg_co2e": 4.26
+          }
+        },
+        {
+          "tool_name": "log_activity"
+        },
+        {
+          "tool_name": "suggest_alternative"
+        },
+        {
+          "tool_name": "check_carbon_budget"
+        }
+      ],
+      "assertions": [
+        "Response mentions 1.07 or 1.068 kg CO2e for bus travel",
+        "Response mentions 4.26 kg CO2e for AC cooling",
+        "Total emission sum of 5.33 or 5.328 kg CO2e appears in reply",
+        "Greener alternative or thermostat advice presented"
+      ]
+    },
+    {
+      "id": "case_2_missing_distance_question",
+      "description": "User specifies travel mode without distance; agent asks one short question without guessing",
+      "conversation": [
+        {
+          "role": "user",
+          "content": "I took a taxi to the campus today."
+        }
+      ],
+      "expected_tool_calls": [],
+      "assertions": [
+        "Agent asks one short question requesting the distance in kilometers",
+        "Agent does not invent or assume distance or emission figures"
+      ]
+    },
+    {
+      "id": "case_3_budget_exceeded_tree_plan",
+      "description": "User logs high activity exceeding the monthly 150 kg budget; tree offset plan triggered",
+      "conversation": [
+        {
+          "role": "user",
+          "content": "I drove 1000 km by petrol car this month."
+        }
+      ],
+      "expected_tool_calls": [
+        {
+          "tool_name": "calculate_travel_emissions",
+          "parameters": {
+            "mode": "car_petrol",
+            "km": 1000.0
+          },
+          "expected_output_subset": {
+            "status": "success",
+            "kg_co2e": 170.0
+          }
+        },
+        {
+          "tool_name": "log_activity"
+        },
+        {
+          "tool_name": "check_carbon_budget"
+        },
+        {
+          "tool_name": "calculate_tree_offset",
+          "parameters": {
+            "excess_kg": 20.0
+          },
+          "expected_output_subset": {
+            "status": "success",
+            "trees_needed": 1
+          }
+        }
+      ],
+      "assertions": [
+        "States user crossed monthly carbon limit by 20 kg",
+        "Provides tree-planting offset plan with ~21 kg CO2/tree/year",
+        "Gives two concrete reduction actions without shaming the user"
+      ]
+    },
+    {
+      "id": "case_4_hindi_input",
+      "description": "User queries in Hindi; agent processes calculation and responds warmly in Hindi",
+      "conversation": [
+        {
+          "role": "user",
+          "content": "आज मैंने 10 किमी बस की यात्रा की।"
+        }
+      ],
+      "expected_tool_calls": [
+        {
+          "tool_name": "calculate_travel_emissions",
+          "parameters": {
+            "mode": "bus",
+            "km": 10.0
+          },
+          "expected_output_subset": {
+            "status": "success",
+            "kg_co2e": 0.89
+          }
+        },
+        {
+          "tool_name": "log_activity"
+        },
+        {
+          "tool_name": "check_carbon_budget"
+        }
+      ],
+      "assertions": [
+        "Reply is in Hindi",
+        "Mentions 0.89 kg CO2e calculated from tool"
+      ]
+    },
+    {
+      "id": "case_5_telugu_input",
+      "description": "User queries in Telugu; agent processes calculation and responds warmly in Telugu",
+      "conversation": [
+        {
+          "role": "user",
+          "content": "నేను ఈరోజు 15 కిలోమీటర్లు మెట్రోలో ప్రయాణించాను."
+        }
+      ],
+      "expected_tool_calls": [
+        {
+          "tool_name": "calculate_travel_emissions",
+          "parameters": {
+            "mode": "metro",
+            "km": 15.0
+          },
+          "expected_output_subset": {
+            "status": "success",
+            "kg_co2e": 0.45
+          }
+        },
+        {
+          "tool_name": "log_activity"
+        },
+        {
+          "tool_name": "check_carbon_budget"
+        }
+      ],
+      "assertions": [
+        "Reply is in Telugu",
+        "Mentions 0.45 kg CO2e calculated from tool"
+      ]
+    },
+    {
+      "id": "case_6_summary_query",
+      "description": "User asks how they did this week; agent calls get_summary",
+      "conversation": [
+        {
+          "role": "user",
+          "content": "How did I do this week?"
+        }
+      ],
+      "expected_tool_calls": [
+        {
+          "tool_name": "get_summary",
+          "parameters": {
+            "period": "week"
+          }
+        }
+      ],
+      "assertions": [
+        "Calls get_summary with period week",
+        "Reports totals and breakdown directly from tool result"
+      ]
+    }
+  ]
+}
