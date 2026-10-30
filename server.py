@@ -8,6 +8,7 @@ originates strictly from calculation tools.
 import os
 import re
 import math
+import asyncio
 from types import SimpleNamespace
 from typing import Dict, Any, List, Optional
 from datetime import datetime
@@ -18,6 +19,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from google.genai import types
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
 
 from carbon_coach.factors import (
     GRID_KG_PER_KWH,
@@ -55,9 +59,21 @@ from carbon_coach.tools import (
     calculate_tree_offset,
     get_leaderboard,
 )
+from carbon_coach.agent import root_agent
 
 load_dotenv()
 init_db()
+
+ADK_APP_NAME = "carbon_coach"
+ADK_TIMEOUT_SECONDS = float(os.getenv("ADK_TIMEOUT_SECONDS", "8"))
+adk_session_service = InMemorySessionService()
+adk_runner = Runner(
+    agent=root_agent,
+    app_name=ADK_APP_NAME,
+    session_service=adk_session_service,
+)
+adk_sessions: Dict[str, str] = {}
+adk_session_lock = asyncio.Lock()
 
 app = FastAPI(
     title="Carbon Coach API",
@@ -114,6 +130,30 @@ def parse_and_process_message(message: str, user_id: str = "default_user") -> Di
     and formats responses strictly complying with CARBON_COACH_SPEC.md rules.
     """
     msg_lower = message.lower().strip()
+    number_words = {
+        "zero": "0",
+        "one": "1",
+        "two": "2",
+        "three": "3",
+        "four": "4",
+        "five": "5",
+        "six": "6",
+        "seven": "7",
+        "eight": "8",
+        "nine": "9",
+        "ten": "10",
+    }
+    for word, number in number_words.items():
+        msg_lower = re.sub(rf"\b{word}\b", number, msg_lower)
+    msg_lower = re.sub(r"\b(?:4|four)[ -]?wheeler\b", "car", msg_lower)
+    msg_lower = re.sub(r"\b(?:a|my)\s+car\b", "car", msg_lower)
+    msg_lower = re.sub(
+        r"\b(car|two[- ]?wheeler|bike|scooter)\b.*?"
+        r"\b(?:travelled|traveled|travel|drove|drive)\s+"
+        r"([0-9]+(?:\.[0-9]+)?)\s*(?:km|kms|kilometers?)\b",
+        r"\2 km by \1",
+        msg_lower,
+    )
     tool_context = SimpleNamespace(user_id=user_id)
     tool_results: List[Dict[str, Any]] = []
     logged_activities: List[Dict[str, Any]] = []
@@ -140,6 +180,7 @@ def parse_and_process_message(message: str, user_id: str = "default_user") -> Di
             "tool_results": tool_results,
             "budget_status": check_carbon_budget(tool_context=tool_context),
         }
+
 
     # 2. "How did I do" / Summary queries
     if any(q in msg_lower for q in ("how did i do", "summary", "my emissions", "my footprint", "report")):
@@ -338,6 +379,23 @@ def parse_and_process_message(message: str, user_id: str = "default_user") -> Di
             extracted = True
 
     # D. Waste extraction
+    burned_waste_pattern = r"(?:burned|burnt|disposed|discarded|threw away|generated|produced)\s+([0-9.]+)\s*(?:kg|kgs|kilograms)\s*(?:of)?\s*(?:waste|weight|garbage|trash)?"
+    for match in re.finditer(burned_waste_pattern, msg_lower):
+        w_kg = float(match.group(1))
+        calc = calculate_waste_emissions("mixed_landfill", w_kg)
+        tool_results.append({"tool": "calculate_waste_emissions", "result": calc})
+        if calc.get("status") == "success":
+            kg = calc["kg_co2e"]
+            log_res = log_activity(
+                "waste",
+                f"mixed_landfill {w_kg} kg",
+                kg,
+                tool_context=tool_context,
+            )
+            tool_results.append({"tool": "log_activity", "result": log_res})
+            logged_activities.append({"category": "waste", "details": f"mixed_landfill {w_kg} kg", "kg_co2e": kg})
+            extracted = True
+
     waste_pattern = r"([0-9.]+)\s*(?:kg|kgs|kilograms)\s*(?:of)?\s*(plastic|paper|food waste|mixed landfill|garbage|trash|recycled)"
     for match in re.finditer(waste_pattern, msg_lower):
         kg_str, waste_raw = match.groups()
@@ -442,16 +500,71 @@ def parse_and_process_message(message: str, user_id: str = "default_user") -> Di
     }
 
 
+async def run_adk_message(message: str, user_id: str) -> str:
+    """Run one message through the configured Google ADK agent session."""
+    async with adk_session_lock:
+        session_id = adk_sessions.get(user_id)
+        if session_id is None:
+            session = await adk_session_service.create_session(
+                app_name=ADK_APP_NAME,
+                user_id=user_id,
+            )
+            session_id = session.id
+            adk_sessions[user_id] = session_id
+
+    content = types.Content(role="user", parts=[types.Part(text=message)])
+    final_text = ""
+    async for event in adk_runner.run_async(
+        user_id=user_id,
+        session_id=session_id,
+        new_message=content,
+    ):
+        if event.is_final_response() and event.content and event.content.parts:
+            final_text = "".join(part.text or "" for part in event.content.parts).strip()
+
+    if not final_text:
+        raise RuntimeError("The ADK agent returned an empty response.")
+    return final_text
+
+
 # --- REST Endpoints ---
 
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest):
-    """Conversational endpoint executing Google ADK tools and returning grounded responses."""
+    """Handle activity messages with all verified tools and other prompts with ADK."""
+    user_id = request.user_id or "default_user"
+
+    # Activity prompts must execute every calculation and logging step
+    # deterministically; an LLM response may otherwise mention only one
+    # recommendation and omit another activity from the same message.
+    activity_response = parse_and_process_message(
+        request.message,
+        user_id=user_id,
+    )
+    if activity_response.get("activities_logged"):
+        activity_response["agent"] = "google_adk_tools"
+        return activity_response
+
     try:
-        response_data = parse_and_process_message(request.message, user_id=request.user_id or "default_user")
+        reply = await asyncio.wait_for(
+            run_adk_message(request.message, user_id),
+            timeout=ADK_TIMEOUT_SECONDS,
+        )
+        return {
+            "reply": reply,
+            "tool_results": [],
+            "agent": "google_adk",
+            "budget_status": check_carbon_budget(
+                tool_context=SimpleNamespace(user_id=user_id),
+            ),
+        }
+    except Exception:
+        response_data = activity_response
+        response_data["agent"] = "deterministic_fallback"
+        response_data["agent_warning"] = (
+            "Google ADK was unavailable for this request; the verified local calculator handled it."
+        )
         return response_data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/activities")
